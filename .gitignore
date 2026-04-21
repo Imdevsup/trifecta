@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+data/
+csv_export/
+analysis/
+lectures/
+training_data/
+*.db
+*.jsonl
+.pytest_cache/
+.claude/
