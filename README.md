@@ -23,7 +23,7 @@ These were picked because frontier LLMs make frequent precision errors, hallucin
 
 The system also produces a rich SQLite research database of every LLM call, every knowledge mutation, every peer conversation, and every test answer — which a companion exporter turns into SFT and DPO fine-tuning datasets that span all eight domains.
 
-The whole thing is built on top of a single OpenAI-compatible chat completion endpoint. No vector DB, no framework, no agent library. Roughly 3,000 lines of Python.
+The whole thing is built on top of a single OpenAI-compatible chat completion endpoint. No vector DB, no framework, no agent library.
 
 ---
 
