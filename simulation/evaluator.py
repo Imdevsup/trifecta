@@ -1,8 +1,9 @@
 """
-Evaluator — Final-test question generator and scorer.
-Generates 30 questions (10 impulse, 10 deep, 10 axiom) sampled from the
-accumulated curriculum (all eight domains) and grades agent answers 0-10
-with a strict rubric. Orchestration lives in simulation.curriculum_test.CurriculumTest.
+Evaluator — Final-test MCQ question generator and deterministic scorer.
+Default path: load the hand-curated static test bank (240 four-option MCQs
+spanning eight PhD-level domains — 30 per domain, 10 impulse / 10 deep /
+10 axiom each). Scoring is exact-match on the chosen letter — no LLM grader
+call. Orchestration lives in simulation.curriculum_test.CurriculumTest.
 """
 
 import time
@@ -14,6 +15,9 @@ import httpx
 
 import config
 from agents.base_agent import rate_limit, clean_llm_response
+
+
+VALID_LETTERS = ("A", "B", "C", "D")
 
 logger = logging.getLogger(__name__)
 
@@ -55,138 +59,213 @@ class Evaluator:
         return "[Evaluator unavailable]"
 
     def generate_questions(self, topics_covered: list[str], rng=None) -> list[dict]:
-        """Generate exactly 30 test questions: 10 impulse, 10 deep, 10 axiom.
-        Samples 10 topics per type from the covered topics (with wraparound if <10 topics)."""
+        """Return the full MCQ exam. Default path: load the hand-curated static test
+        bank (authored by a different model family than the agents, eliminating
+        self-preference bias). Falls back to runtime LLM generation only if the
+        bank import fails. Options are shuffled per-run using `rng` so the correct
+        letter distribution is flat regardless of canonical ordering in the bank."""
         import random as _random
         _rng = rng or _random.Random(42)
 
-        questions = []
+        try:
+            from simulation.static_test_bank import STATIC_QUESTIONS
+        except ImportError as e:
+            logger.warning(
+                f"Static test bank unavailable ({e}); falling back to LLM question generation."
+            )
+            return self._generate_questions_via_llm(topics_covered, _rng)
+
+        questions: list[dict] = []
+        for i, q in enumerate(STATIC_QUESTIONS, start=1):
+            shuffled_options, shuffled_correct = self._shuffle_options(
+                dict(q["options"]), q["correct"], _rng,
+            )
+            questions.append({
+                "number": i,
+                "type": q["type"],
+                "topic": q["topic"],
+                "question": q["question"],
+                "options": shuffled_options,
+                "correct": shuffled_correct,
+            })
+        return questions
+
+    def _generate_questions_via_llm(self, topics_covered: list[str], rng,
+                                     per_type: int = 10) -> list[dict]:
+        """Fallback: generate MCQs via LLM. Used only if the static bank is missing.
+        Returns per_type × 3 questions (default 30)."""
+        questions: list[dict] = []
         n_topics = len(topics_covered)
         if n_topics == 0:
             return questions
 
         number = 1
         for q_type in ["impulse", "deep", "axiom"]:
-            # Sample 10 topics for this question type
-            if n_topics >= 10:
-                selected = _rng.sample(topics_covered, 10)
+            if n_topics >= per_type:
+                selected = rng.sample(topics_covered, per_type)
             else:
-                # Fewer than 10 topics: cycle through them
-                selected = (topics_covered * (10 // n_topics + 1))[:10]
-                _rng.shuffle(selected)
+                selected = (topics_covered * (per_type // n_topics + 1))[:per_type]
+                rng.shuffle(selected)
 
             for topic in selected:
-                q = self._generate_one_question(topic, q_type, number)
-                questions.append({"number": number, "type": q_type, "topic": topic, "question": q})
+                q = self._generate_one_question(topic, q_type, number, rng)
+                if q is not None:
+                    questions.append(q)
                 number += 1
 
         return questions
 
-    def _generate_one_question(self, topic: str, q_type: str, number: int) -> str:
+    def _generate_one_question(self, topic: str, q_type: str, number: int, rng) -> dict | None:
+        """Generate one four-option MCQ. Returns a question dict or None if unparseable after retries."""
         type_instructions = {
-            "impulse": "Generate a quick-recall factual question that tests basic knowledge. It should be answerable in 1-2 sentences.",
-            "deep": "Generate a multi-step analytical question that requires reasoning across concepts. It should need 3-5 sentences to answer properly.",
-            "axiom": "Generate a true/false claim about a fundamental principle, and ask the respondent to evaluate whether it's universally true and justify their answer.",
+            "impulse": "A quick-recall factual question testing a specific fact, definition, constant, or named result.",
+            "deep": "A multi-step analytical question requiring reasoning across concepts, with options that represent different lines of reasoning.",
+            "axiom": "A claim about a fundamental principle, with options that probe whether it is universally true and why (e.g. 'True because...', 'False because...').",
         }
         system = (
-            "You are a fair test question generator for an educational assessment. "
-            "Generate exactly ONE question. Output ONLY the question, nothing else."
+            "You are a precise MCQ question generator for a university-level exam. "
+            "Output exactly one question with four answer options, marking the correct one. "
+            "Distractors must be plausible — related concepts, common misconceptions, or "
+            "near-misses — not obviously wrong. Exactly one option must be clearly correct."
         )
-        messages = [
-            {"role": "user", "content": (
-                f"Topic: {topic}\n"
-                f"Question type: {q_type}\n"
-                f"Instructions: {type_instructions[q_type]}\n"
-                f"Generate question #{number}."
-            )}
-        ]
-        return self._call_llm(system, messages, temperature=0.7, max_tokens=150)
-
-    def _extract_score(self, response: str) -> tuple[float | None, str]:
-        """Robustly extract a score from an LLM grading response.
-        Tries multiple patterns: 'SCORE: X', 'X/10', 'Score: X', bare leading number, etc.
-        Returns (score_or_None, reasoning_string)."""
-        reasoning = ""
-
-        # Try REASONING: line first
-        for line in response.split("\n"):
-            if "REASONING:" in line.upper():
-                reasoning = line.split(":", 1)[-1].strip()
-                break
-
-        # Pattern 1: "SCORE: X" or "Score: X"
-        m = re.search(r'(?i)score\s*:\s*([\d.]+)', response)
-        if m:
-            return min(10.0, max(0.0, float(m.group(1)))), reasoning
-
-        # Pattern 2: "X/10" or "X / 10"
-        m = re.search(r'([\d.]+)\s*/\s*10', response)
-        if m:
-            return min(10.0, max(0.0, float(m.group(1)))), reasoning
-
-        # Pattern 3: "X out of 10"
-        m = re.search(r'([\d.]+)\s+out\s+of\s+10', response, re.IGNORECASE)
-        if m:
-            return min(10.0, max(0.0, float(m.group(1)))), reasoning
-
-        # Pattern 4: response starts with a number (model just outputs "7\nReasoning...")
-        m = re.match(r'\s*([\d.]+)\s', response)
-        if m:
-            val = float(m.group(1))
-            if 0 <= val <= 10:
-                return val, reasoning
-
-        # Pattern 5: any standalone number 0-10 in the first line
-        first_line = response.strip().split("\n")[0] if response.strip() else ""
-        nums = re.findall(r'\b(\d+(?:\.\d+)?)\b', first_line)
-        for n in nums:
-            val = float(n)
-            if 0 <= val <= 10:
-                return val, reasoning
-
-        return None, reasoning
-
-    def score_answer(self, question: str, answer: str, q_type: str, topic: str) -> tuple[float, str]:
-        """Score an agent's answer 0-10. Returns (score, reasoning).
-        Retries until the LLM returns a parseable score."""
-        if config.DRY_RUN:
-            return 5.0, "[dry-run placeholder score]"
-
-        system = (
-            "You are a STRICT academic exam grader. Grade the answer 0-10 using this rubric:\n"
-            "  1-2: Wrong, irrelevant, or nonsensical answer\n"
-            "  3-4: Partially correct but with major errors or critical omissions\n"
-            "  5-6: Correct core idea but shallow, vague, or missing important details\n"
-            "  7-8: Mostly correct and well-reasoned, minor gaps or imprecisions\n"
-            "  9:   Excellent — accurate, thorough, and well-structured\n"
-            "  10:  Perfect — flawless, comprehensive, demonstrates deep mastery\n\n"
-            "BE DISCRIMINATING. Do NOT default to 7-8 for everything. A mediocre answer "
-            "that restates the question or gives only surface-level facts deserves 4-5. "
-            "Reserve 9-10 for genuinely outstanding answers.\n\n"
-            "Reply ONLY in this format:\n"
-            "SCORE: <number>\n"
-            "REASONING: <one sentence explaining the score>"
+        user_msg = (
+            f"Topic: {topic}\n"
+            f"Question type: {q_type}\n"
+            f"Instructions: {type_instructions[q_type]}\n\n"
+            f"Output in this EXACT format — no preamble, no trailing commentary:\n"
+            f"QUESTION: <the question>\n"
+            f"A) <option A>\n"
+            f"B) <option B>\n"
+            f"C) <option C>\n"
+            f"D) <option D>\n"
+            f"CORRECT: <single letter A, B, C, or D>"
         )
-        messages = [
-            {"role": "user", "content": (
-                f"Topic: {topic}\nType: {q_type}\n"
-                f"Question: {question[:500]}\n"
-                f"Answer: {answer[:800]}\n"
-                f"Grade 0-10 using the strict rubric."
-            )}
-        ]
 
         for attempt in range(config.MAX_RETRIES):
-            response = self._call_llm(system, messages, temperature=0.2, max_tokens=80)
-            score, reasoning = self._extract_score(response)
+            response = self._call_llm(
+                system, [{"role": "user", "content": user_msg}],
+                temperature=0.7, max_tokens=400,
+            )
+            parsed = self._parse_mcq(response)
+            if parsed is not None:
+                question_text, options, correct_letter = parsed
+                # Shuffle options so the correct letter isn't biased by the generator
+                shuffled_options, shuffled_correct = self._shuffle_options(options, correct_letter, rng)
+                return {
+                    "number": number,
+                    "type": q_type,
+                    "topic": topic,
+                    "question": question_text,
+                    "options": shuffled_options,
+                    "correct": shuffled_correct,
+                }
 
-            if score is not None:
-                return score, reasoning if reasoning else response.strip()
-
-            logger.warning(f"Evaluator: no score parseable from response (attempt {attempt+1}), retrying...")
+            logger.warning(f"Evaluator: MCQ parse failed for #{number} ({q_type}) attempt {attempt+1}, retrying...")
             time.sleep(config.RETRY_BASE_DELAY)
 
-        # All retries exhausted — return 0 with the raw response as reasoning
-        logger.error("Evaluator: could not get valid score after all retries")
-        return 0.0, response.strip()
+        logger.error(f"Evaluator: could not generate MCQ #{number} after all retries, skipping")
+        return None
+
+    @staticmethod
+    def _parse_mcq(response: str) -> tuple[str, dict[str, str], str] | None:
+        """Parse QUESTION/A)/B)/C)/D)/CORRECT block. Returns (question, options, correct_letter) or None."""
+        if not response:
+            return None
+
+        q_match = re.search(r'(?im)^\s*QUESTION\s*:\s*(.+?)(?=\n\s*[A-D][\)\.]|\Z)', response, re.DOTALL)
+        if not q_match:
+            return None
+        question_text = q_match.group(1).strip()
+        if len(question_text) < 5:
+            return None
+
+        options: dict[str, str] = {}
+        for letter in VALID_LETTERS:
+            m = re.search(
+                rf'(?im)^\s*{letter}\s*[\)\.]\s*(.+?)(?=\n\s*[A-D]\s*[\)\.]|\n\s*CORRECT\s*:|\Z)',
+                response, re.DOTALL,
+            )
+            if not m:
+                return None
+            text = m.group(1).strip()
+            if len(text) < 1:
+                return None
+            options[letter] = text
+
+        c_match = re.search(r'(?im)^\s*CORRECT\s*:\s*([A-Da-d])', response)
+        if not c_match:
+            return None
+        correct = c_match.group(1).upper()
+
+        return question_text, options, correct
+
+    @staticmethod
+    def _shuffle_options(options: dict[str, str], correct_letter: str, rng) -> tuple[dict[str, str], str]:
+        """Shuffle the four option texts into A/B/C/D slots; return new options dict and the new correct letter."""
+        texts = [options[l] for l in VALID_LETTERS]
+        correct_text = options[correct_letter]
+        rng.shuffle(texts)
+        new_options = {letter: texts[i] for i, letter in enumerate(VALID_LETTERS)}
+        new_correct = next(l for l, t in new_options.items() if t == correct_text)
+        return new_options, new_correct
+
+    @staticmethod
+    def _extract_chosen_letter(answer: str) -> str | None:
+        """Extract the agent's chosen letter from its response. Returns 'A'|'B'|'C'|'D' or None."""
+        if not answer:
+            return None
+
+        # Prefer the LAST 'ANSWER: X' in the response (agents may cite options mid-reasoning)
+        matches = re.findall(r'(?i)ANSWER\s*:\s*([A-Da-d])\b', answer)
+        if matches:
+            return matches[-1].upper()
+
+        # Fallback: a bare letter on its own line (last occurrence)
+        for line in reversed(answer.strip().split("\n")):
+            s = line.strip().rstrip(".)(").upper()
+            if s in VALID_LETTERS:
+                return s
+
+        return None
+
+    @staticmethod
+    def extract_labeled_letter(response: str, labels: tuple[str, ...]) -> str | None:
+        """Extract a letter from a response, preferring any of the given line labels
+        (e.g. 'LETTER', 'CURRENT_LETTER', 'FINAL_LETTER'). Uses the LAST match to handle
+        agents that reconsider mid-response. Falls back to a trailing bare letter."""
+        if not response:
+            return None
+        for label in labels:
+            matches = re.findall(rf'(?i){label}\s*:\s*([A-Da-d])\b', response)
+            if matches:
+                return matches[-1].upper()
+        for line in reversed(response.strip().split("\n")):
+            s = line.strip().rstrip(".)(").upper()
+            if s in VALID_LETTERS:
+                return s
+        return None
+
+    @staticmethod
+    def extract_reasoning(response: str, label: str = "REASONING") -> str:
+        """Extract a single-line reasoning field from a structured response."""
+        if not response:
+            return ""
+        m = re.search(rf'(?im)^\s*{label}\s*:\s*(.+?)(?:\n\s*[A-Z_]+\s*:|\Z)', response, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        return ""
+
+    def score_answer(self, question: str, answer: str, q_type: str, topic: str,
+                     correct: str = "") -> tuple[float, str]:
+        """Deterministic MCQ scoring: 1.0 if chosen letter matches correct, 0.0 otherwise.
+        No LLM call — safe under DRY_RUN too. Unparseable answers score 0."""
+        if not correct:
+            return 0.0, "no correct letter provided"
+
+        chosen = self._extract_chosen_letter(answer)
+        if chosen is None:
+            return 0.0, f"unparseable; correct was {correct}"
+        if chosen == correct.upper():
+            return 1.0, f"correct ({chosen})"
+        return 0.0, f"chose {chosen}, correct was {correct.upper()}"
 

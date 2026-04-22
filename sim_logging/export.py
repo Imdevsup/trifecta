@@ -40,7 +40,7 @@ def export_summary_stats(db_logger, analysis_dir: Path, agents: dict):
         tokens_out = sum(i.get("tokens_out", 0) for i in agent_interactions)
 
         test_score = sum(t.get("score", 0) for t in agent_tests)
-        test_max = len(agent_tests) * 10 if agent_tests else 1
+        test_max = len(agent_tests) if agent_tests else 1
 
         # Knowledge store sizes
         store_sizes = {}
@@ -138,16 +138,16 @@ def export_survival_report(db_logger, analysis_dir: Path):
 
     pass_pct = config.PASS_THRESHOLD * 100
     for agent, data in agent_scores.items():
-        max_score = data["count"] * 10
+        max_score = data["count"]
         pct = (data["total"] / max_score * 100) if max_score > 0 else 0
         survived = pct >= pass_pct
         status = "SURVIVED" if survived else "ELIMINATED"
         report_lines.append(f"### {agent.upper()} — {status}")
-        report_lines.append(f"- Total score: {data['total']:.1f}/{max_score} ({pct:.1f}%)")
+        report_lines.append(f"- Total score: {int(data['total'])}/{max_score} ({pct:.1f}%)")
         for q_type, type_data in data["by_type"].items():
-            type_max = type_data["count"] * 10
+            type_max = type_data["count"]
             type_pct = (type_data["total"] / type_max * 100) if type_max > 0 else 0
-            report_lines.append(f"  - {q_type}: {type_data['total']:.1f}/{type_max} ({type_pct:.1f}%)")
+            report_lines.append(f"  - {q_type}: {int(type_data['total'])}/{type_max} ({type_pct:.1f}%)")
         report_lines.append("")
 
     # Overflow analysis

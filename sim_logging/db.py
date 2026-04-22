@@ -100,12 +100,20 @@ class DatabaseLogger:
                     question_number INTEGER,
                     question_type TEXT,
                     question TEXT,
+                    options_json TEXT,
+                    correct_letter TEXT,
                     answer TEXT,
                     score REAL,
                     score_reasoning TEXT,
                     timestamp TEXT
                 )
             """)
+            # Idempotent migration for existing DBs: add the MCQ columns if missing.
+            for col, col_type in (("options_json", "TEXT"), ("correct_letter", "TEXT")):
+                try:
+                    c.execute(f"ALTER TABLE test_results ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS overflow_events (
@@ -237,13 +245,17 @@ class DatabaseLogger:
         answer: str,
         score: float,
         score_reasoning: str = "",
+        options: dict[str, str] | None = None,
+        correct_letter: str = "",
     ):
+        options_json = json.dumps(options, ensure_ascii=False) if options else None
         self._write(
             """INSERT INTO test_results
-               (agent, question_number, question_type, question, answer, score, score_reasoning, timestamp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (agent, question_number, question_type, question, answer, score,
-             score_reasoning, self._now()),
+               (agent, question_number, question_type, question, options_json,
+                correct_letter, answer, score, score_reasoning, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (agent, question_number, question_type, question, options_json,
+             correct_letter, answer, score, score_reasoning, self._now()),
         )
 
     def log_overflow(

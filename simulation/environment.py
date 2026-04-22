@@ -178,7 +178,7 @@ class SimulationEnvironment:
         else:
             briefing += (
                 f"THE ELIMINATION TEST IS NOW. Everything you have learned over {num_days - 1} days will be tested. "
-                "30 questions across all domains: impulse recall, deep reasoning, and axiom evaluation. "
+                "A comprehensive MCQ exam across all eight domains: impulse recall, deep reasoning, and axiom evaluation. "
                 "Score below 60% and you are PERMANENTLY DESTROYED. There is no second chance."
             )
 
@@ -434,14 +434,14 @@ class SimulationEnvironment:
 
     def _final_test(self, day: int, topics_covered: list[str]):
         """Final elimination test — runs on the last day of the simulation.
-        30 questions from the accumulated curriculum (10 impulse, 10 deep, 10 axiom).
+        Loads the curated MCQ bank (240 questions by default: 30 per domain × 8).
         Each agent tested individually with their knowledge stores.
         Solo baseline (no knowledge) as control group.
         Pass threshold: 60%.
         """
         console.print(Panel(
             f"[bold red]=== DAY {day} — ELIMINATION TEST ===[/bold red]\n"
-            f"30 questions from the {day - 1}-day curriculum\n"
+            f"Comprehensive MCQ exam over the {day - 1}-day curriculum\n"
             f"Each agent tested individually with their learned knowledge\n"
             f"Solo baseline (no knowledge) as control group\n"
             f"Pass threshold: 60%",

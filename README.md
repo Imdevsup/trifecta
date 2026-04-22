@@ -560,60 +560,58 @@ This pipeline is the single most expensive step per proposal — it's three LLM 
 
 ## 9. The Final Elimination Exam
 
-Defined in `simulation/curriculum_test.py` (orchestration) and `simulation/evaluator.py` (question generation + scoring).
+Defined in `simulation/curriculum_test.py` (orchestration), `simulation/evaluator.py` (loader + deterministic scorer), and `simulation/static_test_bank.py` (the hand-curated question set).
 
-### 9.1 Question Generation
+The exam is **240 four-option multiple-choice questions** spanning all eight domains — 30 per domain, balanced 10 impulse / 10 deep / 10 axiom. Scoring is deterministic exact-match on the chosen letter: 1 point correct, 0 wrong. No LLM grader; no grader bias.
 
-`Evaluator.generate_questions(topics_covered, rng)` produces exactly 30 questions:
+### 9.1 The Static Test Bank
 
-- 10 **impulse** — quick-recall factual questions, 1–2 sentence expected answers.
-- 10 **deep** — multi-step analytical questions requiring reasoning across concepts, 3–5 sentence expected answers.
-- 10 **axiom** — true/false claims about fundamental principles that the respondent must evaluate and justify.
+`simulation/static_test_bank.py` contains 240 hand-written MCQs authored by **Claude Opus 4.7** — deliberately a different model family than the agents under test (gpt-5-nano by default). Using a non-sibling model for question authorship removes the last self-preference bias: "correct" options aren't phrased in the agents' native idiom, so the agents must actually reason about the content to pick the right letter.
 
-For each type, 10 topics are sampled from `topics_covered` (with cycling if fewer than 10 topics exist), and one question is generated per sampled topic. Temperature 0.7, max 150 tokens per question.
+Structural invariants (enforced at import time):
+- Exactly 240 total questions.
+- 80 of each type (impulse / deep / axiom).
+- 30 per domain × 8 domains, with every domain carrying 10 impulse + 10 deep + 10 axiom.
+- Each question has exactly four options labeled A / B / C / D, with one marked correct.
 
-### 9.2 Test Execution
+`Evaluator.generate_questions(topics_covered, rng)` loads the bank, **shuffles the A/B/C/D positions per-run** using the run's rng (so the canonical correct-letter distribution in the source file doesn't bias results), assigns `number` 1..240, and returns the list. `topics_covered` is unused when the static bank is available — the exam is a fixed, domain-balanced benchmark, not a curriculum-conditioned sample. If `simulation.static_test_bank` fails to import, the evaluator falls back to runtime LLM generation (legacy path, left in for completeness; not recommended because it re-introduces self-preference bias).
 
-`CurriculumTest.run_full_comparison` does two passes.
+### 9.2 Three Test Phases
 
-**Pass 1 — every agent tested individually with knowledge.** For each question, `agent.answer_test_question(question, type, day, use_knowledge=True)` is called:
+`CurriculumTest.run_full_comparison` runs three phases in sequence and populates five rows on the scoreboard: `alpha`, `beta`, `gamma`, `triad`, `solo_baseline`.
 
-- Builds the agent's system prompt (with `"FINAL_TEST"` phase).
-- Injects knowledge using `include_deep=True, use_bundles=True` — so the injection comes in as concept bundles (see 5.6) with deep entries included.
-- Budget-truncates to `EXAM_KNOWLEDGE_BUDGET_WORDS = 4000`.
-- Wraps the question in a "Humanity's Last Exam — Short Answer" template that instructs the model to think step by step and put the final answer on its own line as `ANSWER: ...`.
+**Phase 1 — Individual agents with knowledge.** For each agent, every MCQ is answered alone via `agent.answer_test_question(question, type, day, options, use_knowledge=True)`:
+- Builds the agent's `"FINAL_TEST"` system prompt.
+- Injects knowledge with `include_deep=True, use_bundles=True` (see 5.6).
+- Budget-truncates to `EXAM_KNOWLEDGE_BUDGET_WORDS = 5000`.
+- Renders the question with all four labeled options and instructs the model to reason through each, then finish on its own line with `ANSWER: <letter>`.
 - Temperature 0.2, max 800 tokens.
 
-Before pass 1 starts, `prepare_stores_for_exam` is called on every agent to pre-build the TF-IDF cache on all stores — otherwise the first retrieval per store would pay the build cost.
+Before Phase 1, `prepare_stores_for_exam` pre-builds every agent's TF-IDF retrieval cache so the first retrieval doesn't pay the build cost.
 
-**Pass 2 — solo baseline (control group).** The same 30 questions are answered by one of the agents' underlying client with `use_knowledge=False`, meaning no JSON stores, no DB retrieval, no concept bundles, no prior learning — but the agent's personality system prompt is still present. This is "same model, cold, with a persona" — not a fully neutral baseline. If you need a fully neutral baseline you'd need to edit `_run_solo_baseline` to bypass `build_system_prompt` as well.
+**Phase 1.5 — Triad collaborative deliberation.** The three agents *talk to each other* and vote on every question:
+
+1. **Round 1 — Opening (parallel, 3 calls).** Each agent commits a letter + two-sentence rationale based on their own knowledge. They do not see each other yet.
+2. **Round 2 — Critique (3 calls).** Each agent reads the other two openings and tags each with one of `APPROVE` / `DISAPPROVE` / `REFINE` / `BUILD`, giving a specific reason. They may update their own letter if persuaded.
+3. **Round 3 — Final vote (3 calls).** Each agent reads the full nine-line transcript and commits a final letter.
+
+The triad's answer is **majority vote** (3-0 unanimous or 2-1). On a three-way split across A/B/C/D, the tie is broken by **Gamma** (consistent with their in-sim role as axiom guardian). The full deliberation transcript is stored in `test_results.answer` for the agent `'triad'` so you can inspect who moved during the discussion.
+
+**Phase 2 — Solo baseline (control).** One of the agents' underlying clients answers the same 240 MCQs with `use_knowledge=False` — no JSON stores, no DB retrieval, no concept bundles. The agent's persona system prompt is still present (see 9.5).
 
 ### 9.3 Scoring
 
-Every answer is scored by `Evaluator.score_answer` — a separate LLM call at temperature 0.2, max 80 tokens. The grading system prompt is a strict 0–10 rubric:
+Pure exact-match on the chosen letter, no LLM call. `Evaluator.score_answer` extracts the last `ANSWER: <letter>` from the agent's response (with a bare-letter fallback), compares it to the question's `correct` field, and returns `1.0` for a match or `0.0` otherwise. Unparseable responses score `0.0` with `"unparseable; correct was X"` as the reasoning.
 
-| Score | Meaning |
-|-------|---------|
-| 1–2   | Wrong, irrelevant, or nonsensical |
-| 3–4   | Partially correct but with major errors or critical omissions |
-| 5–6   | Correct core idea but shallow, vague, or missing important details |
-| 7–8   | Mostly correct and well-reasoned, minor gaps |
-| 9     | Excellent — accurate, thorough, and well-structured |
-| 10    | Perfect — flawless, comprehensive, deep mastery |
-
-The rubric includes an explicit "BE DISCRIMINATING. Do NOT default to 7–8 for everything" instruction and reserves 9–10 for genuinely outstanding answers.
-
-The response is expected as:
-```
-SCORE: <number>
-REASONING: <one sentence>
-```
-
-`_extract_score` is defensive — it tries five patterns in order (`SCORE: X`, `X/10`, `X out of 10`, leading number, standalone number in first line) before retrying. If all retries fail to produce a parseable score, the answer gets 0 with the raw grader response as reasoning.
+Triad answers use a different extraction chain (Round 3's `FINAL_LETTER:` field per agent, falling back through Round 2's `CURRENT_LETTER:` and Round 1's `LETTER:`) before aggregation.
 
 ### 9.4 Pass Threshold and Survival
 
-`PASS_THRESHOLD = 0.6`. Every agent whose total score ≥ 60% of the 300 possible points (30 × 10) is `SURVIVED`; everyone else is `ELIMINATED`. The outcome is both logged (every Q&A pair goes to `test_results`) and printed in a comparison table with delta-vs-baseline for each agent.
+`PASS_THRESHOLD = 0.6`. Every scoreboard entry whose total score ≥ 60% of 240 (i.e. ≥144 correct) is `SURVIVED`; everyone else is `ELIMINATED`. Chance baseline on 4-option MCQ is 25%, so anything below ~30% is indistinguishable from guessing.
+
+The console prints a comparison table with per-type breakdowns and delta-vs-baseline for each scoreboard entry. The key experimental contrasts:
+- `triad` vs `max(alpha, beta, gamma)` — **does collaboration beat the best individual?** This is the core triad hypothesis.
+- `max(*)` vs `solo_baseline` — does any learning happen at all vs raw model?
 
 ### 9.5 Caveat on "Solo Baseline"
 
@@ -651,8 +649,9 @@ Trifecta/
     question_oracle.py             # QuestionOracle: generates lectures, answers Q's
     communication.py               # CommunicationBus: peer exchanges, knowledge grounding
     curriculum.py                  # split_into_subtopics, build_lecture_prompt
-    curriculum_test.py             # CurriculumTest: final test orchestration, baseline
-    evaluator.py                   # Evaluator: question generation + 0-10 scoring
+    curriculum_test.py             # CurriculumTest: individual + triad collaborative + baseline
+    evaluator.py                   # Evaluator: MCQ bank loader + deterministic letter-match scoring
+    static_test_bank.py            # 240 hand-curated MCQs (Claude Opus 4.7), 30 per domain
 
   sim_logging/
     __init__.py
@@ -978,9 +977,11 @@ EXAM_KNOWLEDGE_BUDGET_WORDS = 5000    # ~6K tokens — final exam
 
 Bumped from the single-domain values (2500 / 4000) because cross-domain exam retrieval needs a bit more room — the injected context at test time can come from any of eight different curricula. Raise further on large-context models, lower on small-context models. The budget is applied post-injection by `_budget_knowledge_injection`, which does a word-level hard truncation.
 
-### 14.9 Scoring Rubric
+### 14.9 MCQ Test Bank
 
-In `simulation/evaluator.py`, `score_answer` has the rubric inlined as a system prompt. Edit the text to be stricter, gentler, or to emphasize specific qualities (e.g., demand step-by-step reasoning).
+The 240-question static bank lives in `simulation/static_test_bank.py` as a list of dicts, each with `type` / `topic` / `question` / `options` / `correct`. Edit a question's stem, options, or `correct` letter to change it. Edit the domain label (`topic`) to re-assign it to a different bucket. Structural invariants (30 per domain, 10/10/10 per type per domain, 240 total) are enforced at import time via `assert`s at the bottom of the file — if you add or remove a question, adjust another slot in the same domain/type to keep the counts balanced, or update the asserts.
+
+To disable the static bank and fall back to runtime LLM question generation (not recommended — it re-introduces self-preference bias), rename or delete `simulation/static_test_bank.py`. The evaluator's `generate_questions` catches the `ImportError` and calls `_generate_questions_via_llm` as a fallback.
 
 ### 14.10 Rate Limits
 
@@ -1033,19 +1034,20 @@ Three files into the output directory (default `training_data/`):
 - **`dpo.jsonl`** — preference data in TRL / axolotl format:
   ```json
   {"prompt": "...", "chosen": "...", "rejected": "...",
-   "chosen_score": 9.0, "rejected_score": 4.0,
+   "chosen_score": 1.0, "rejected_score": 0.0,
    "chosen_agent": "gamma", "rejected_agent": "alpha"}
   ```
+  With binary MCQ scoring, every `chosen`/`rejected` pair is a correct-vs-wrong answer on the same question — a clean preference signal.
 - **`dataset_manifest.json`** — provenance: source DB path, generation time, all filter parameters, and per-source counts.
 
 ### 15.2 Sources
 
 The DB logger stores every prompt and response **untruncated** (the `*_preview` column names are historical — they keep the full text). That lets the exporter train directly on real content rather than summaries.
 
-Three sources, in priority order:
+Four sources, in priority order:
 
-1. **`test_results`** → SFT. Question + answer + score. Only rows with `score ≥ min_score` (default 7.0) are kept. **Highest quality** because the grader filter catches wrong answers.
-2. **`test_results`** → DPO. Per-question: best agent's answer vs worst agent's answer, if the score gap is ≥ `dpo_gap` (default 3.0). Each of the 30 final-test questions can produce up to one DPO pair.
+1. **`test_results`** → SFT. Full MCQ (question + four labeled options) + agent's reasoning ending in `ANSWER: <letter>`. Only rows with `score ≥ min_score` (default 1.0, i.e. correct answers only) are kept. The exporter reconstructs the MCQ user prompt from the stored `options_json` so the trained model sees exactly what the agents saw at test time. **Triad rows (`agent='triad'`) are skipped** — their `answer` field holds the aggregated three-round deliberation transcript, not a single-turn response, so they aren't directly usable as chat-format SFT.
+2. **`test_results`** → DPO. Per-question: best agent's answer vs worst agent's answer, if the score gap is ≥ `dpo_gap` (default 1.0). With binary scoring this always means correct-vs-wrong. Triad rows are likewise excluded so pairs are always per-agent vs per-agent at the same MCQ. Each MCQ can produce up to one DPO pair.
 3. **`interactions`** (opt-in via `--include-interactions`) → SFT. Oracle answers (`action LIKE 'answer_for_%'`) and oracle lectures (`action LIKE 'lecture_%'`). The lectures are the **richest** long-form content — multi-paragraph expert writeups on every curriculum topic.
 4. **`conversations`** (opt-in via `--include-conversations`) → multi-turn SFT. Each peer conversation becomes one training example, with the first speaker mapped to `user` role and the other to `assistant`. Truncated at the first unclean turn, so a partially-broken transcript still contributes its clean prefix.
 
@@ -1061,16 +1063,15 @@ These never end up in the training data. Counts of dropped examples are reported
 ### 15.4 Usage
 
 ```bash
-# Minimal — SFT from final exam only, score >= 7.0, DPO gap >= 3.0
+# Minimal — SFT from final exam only: correct MCQ answers + per-question correct-vs-wrong DPO pairs
 python -m sim_logging.export_dataset
 
-# High-quality only, include lectures as extra SFT content
-python -m sim_logging.export_dataset --min-score 8 --include-interactions
+# Add the long-form oracle lectures and Q&A — the real corpus
+python -m sim_logging.export_dataset --include-interactions
 
 # Everything, including peer conversations
 python -m sim_logging.export_dataset \
-    --include-interactions --include-conversations \
-    --min-score 6 --dpo-gap 2
+    --include-interactions --include-conversations
 
 # Dry-run — counts only, no files written
 python -m sim_logging.export_dataset --include-interactions --dry-run
@@ -1082,7 +1083,7 @@ python -m sim_logging.export_dataset \
 
 # Custom system prompt on every SFT record
 python -m sim_logging.export_dataset \
-    --system-prompt "You are a graduate-level math tutor. Answer rigorously."
+    --system-prompt "You are a graduate-level tutor. Answer rigorously."
 ```
 
 ### 15.5 CLI Flags
@@ -1091,8 +1092,8 @@ python -m sim_logging.export_dataset \
 |---|---|---|
 | `--db PATH` | `config.LOG_DB_PATH` | Path to the simulation database |
 | `--out PATH` | `training_data/` | Output directory |
-| `--min-score FLOAT` | 7.0 | Minimum grader score for SFT inclusion from `test_results` |
-| `--dpo-gap FLOAT` | 3.0 | Minimum score gap between chosen and rejected for a DPO pair |
+| `--min-score FLOAT` | 1.0 | Minimum MCQ score (0 or 1) for SFT inclusion — `1.0` keeps only correct answers |
+| `--dpo-gap FLOAT` | 1.0 | Minimum score gap between chosen (correct) and rejected (wrong) for DPO pairs |
 | `--include-conversations` | off | Add peer conversations as multi-turn SFT (lower quality) |
 | `--include-interactions` | off | Add oracle Q&A and full lectures as SFT |
 | `--system-prompt STR` | generic tutor prompt | System message prepended to every SFT example |
@@ -1103,20 +1104,24 @@ python -m sim_logging.export_dataset \
 ```
 Exported:
   SFT total:              3984
-    from test_results:    118          (30 Q x 4 agents @ score >= 7, a few dropped)
+    from test_results:    840          (~240 MCQs x ~3.5 agents at score=1.0, avg correct per agent)
     from oracle Q&A:      1820
     from lectures:        2046
-  DPO pairs:              26           (of 30 questions, 4 had insufficient gap or identical answers)
+  DPO pairs:              198          (MCQs where at least one agent was correct and another was wrong)
   Dropped — error/placeholder: 3
   Dropped — too short:         0
 
   Output: /path/to/training_data/
     sft.jsonl              (3984 records)
-    dpo.jsonl              (26 records)
+    dpo.jsonl              (198 records)
     dataset_manifest.json
 ```
 
-The count for `from test_results` is 4 × 30 = 120 max (4 test-takers including baseline, 30 questions each), assuming all answers pass the score gate. Lectures: one per subtopic per day — with ~6 subtopics/day × 364 learning days on a full run, the ceiling is ~2200 lectures **distributed across all eight domains**. Oracle Q&A: 5 follow-up questions × 3 agents × 364 days = 5460 potential records, pruned by the error / short-text filters.
+Ceilings for a full run:
+- **`from test_results`** tops out at 4 × 240 = 960 (alpha + beta + gamma + baseline, 240 MCQs each). Triad rows are excluded. Actual count depends on how many agents got each question right.
+- **Lectures**: one per subtopic per day — with ~6 subtopics/day × 364 learning days, the ceiling is ~2200 lectures, distributed evenly across the eight domains.
+- **Oracle Q&A**: 5 follow-up questions × 3 agents × 364 days = 5460 potential records, pruned by error / short-text filters.
+- **Conversations** (multi-turn): 3 peer pairs × 364 days ≈ 1100 transcripts.
 
 Because the curriculum rotates, the exported SFT is naturally multi-domain — roughly one-eighth of every source type is drawn from each of the eight curricula, all graded to the same quality bar. That's the "more varied datasets" benefit: a single export produces training data spanning math, physics, formal methods, TCS, biology, philosophy, finance, and linguistics without any post-processing.
 
@@ -1195,19 +1200,21 @@ Index: `(agent, day)`. Snapshots are the single largest source of DB growth — 
 
 ### 16.5 `test_results`
 
-Final exam answers and scores.
+Final exam answers and scores. 5 scoreboard entries × 240 MCQs = 1,200 rows per run.
 
 | Column | Type | Description |
 |---|---|---|
-| `agent` | TEXT | `alpha` / `beta` / `gamma` / `solo_baseline` |
-| `question_number` | INTEGER | 1–30 |
+| `agent` | TEXT | `alpha` / `beta` / `gamma` / `triad` / `solo_baseline` |
+| `question_number` | INTEGER | 1–240 |
 | `question_type` | TEXT | `impulse` / `deep` / `axiom` |
-| `question` | TEXT | Full question |
-| `answer` | TEXT | Full answer |
-| `score` | REAL | 0.0–10.0 |
-| `score_reasoning` | TEXT | Grader's one-sentence justification |
+| `question` | TEXT | Full question stem |
+| `options_json` | TEXT | JSON of `{"A": "...", "B": "...", "C": "...", "D": "..."}` — options as shuffled for this run |
+| `correct_letter` | TEXT | The correct letter for this shuffled layout |
+| `answer` | TEXT | For individual agents / baseline: full reasoning + `ANSWER: <letter>`. For `triad`: the full three-round deliberation transcript (openings → critiques → finals → aggregation method) |
+| `score` | REAL | `1.0` if the agent's chosen letter matched `correct_letter`, else `0.0` |
+| `score_reasoning` | TEXT | `"correct (A)"` / `"chose B, correct was A"` / `"unparseable; correct was A"`; triad rows also carry the aggregation method (`"unanimous (B)"`, `"majority 2/3 (B)"`, `"tie broken by gamma (C)"`) |
 
-Index: `(agent)`.
+Index: `(agent)`. The `options_json` + `correct_letter` columns are added via idempotent `ALTER TABLE` at DB open time, so older DBs (from before the MCQ migration) pick them up automatically.
 
 ### 16.6 `overflow_events`
 
@@ -1503,13 +1510,13 @@ The model sometimes returns a one-line title with no numbered subtopics, or a bl
 
 Expected. The individual agent system prompts reference `config.DEFAULT_DAYS = 365`, not the CLI `--days` override. The console briefing in WAKE *does* respect the override. If you need the agent-side countdown to match, either change `DEFAULT_DAYS` in `config.py` or edit the three `build_system_prompt` methods to use `num_days` instead of `config.DEFAULT_DAYS`.
 
-### Evaluator returns score = 0.0 with a full reasoning string
+### Test row score = 0 with `score_reasoning = "unparseable; correct was X"`
 
-`_extract_score` tries five patterns to parse a number. If none match after `MAX_RETRIES` attempts, it gives up with 0.0 and the raw response as reasoning. Usually means the grader is rambling instead of following the `SCORE: <number>` format — try lowering `temperature` in `score_answer` or tightening the rubric.
+The agent's response didn't end with `ANSWER: <letter>` and had no bare trailing letter the fallback could catch. Usually means the model is ignoring the output format — tighten the instruction in `BaseAgent.answer_test_question` (or raise `max_tokens` if it's getting truncated mid-reasoning before emitting the letter).
 
 ### `export_dataset` reports 0 records
 
-Either the simulation hasn't run the final test (no `test_results` rows) or `--min-score` is too strict. Try `--min-score 5 --dry-run` to see what's available.
+Either the simulation hasn't run the final test (no `test_results` rows), or every agent got every question wrong (so `--min-score 1.0` excludes them all). Long-form content is still usable — run with `--include-interactions --include-conversations` to pull in lectures, oracle Q&A, and peer transcripts regardless of test outcomes.
 
 ---
 

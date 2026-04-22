@@ -3,6 +3,7 @@ Base Agent — Abstract base class for all cognitive units.
 Handles LLM calls via OpenAI, knowledge injection from JSON + DB, and message history.
 """
 
+import re
 import time
 import logging
 import threading
@@ -305,32 +306,185 @@ class BaseAgent(ABC):
         self.message_history.append({"role": "assistant", "content": response})
         return response
 
-    def answer_test_question(self, question: str, question_type: str, day: int, use_knowledge: bool = True) -> str:
-        """Answer a test question. If use_knowledge=False, answers with raw model only (no knowledge injection)."""
+    def _exam_system_prompt(self, question: str, day: int) -> str:
+        """Build the knowledge-injected exam system prompt shared across MCQ test modes."""
+        base_prompt = self.build_system_prompt(day, "FINAL_TEST", "comprehensive review")
+        system = self.inject_knowledge(base_prompt, question, include_deep=True, use_bundles=True)
+        return self._budget_knowledge_injection(system, max_words=config.EXAM_KNOWLEDGE_BUDGET_WORDS)
+
+    @staticmethod
+    def _format_options(options: dict[str, str]) -> str:
+        return "\n".join(f"{l}) {options[l]}" for l in ("A", "B", "C", "D") if l in options)
+
+    def mcq_opening(self, question: str, options: dict[str, str], day: int,
+                    question_type: str = "", topic: str = "") -> dict:
+        """Round 1 of the triad collaborative test: initial draft.
+        Returns {'letter', 'reasoning', 'raw'}."""
+        from simulation.evaluator import Evaluator
+
+        system = self._exam_system_prompt(question, day)
+        options_block = self._format_options(options)
+        instruction = (
+            "HUMANITY'S LAST EXAM — MULTIPLE CHOICE [ROUND 1 of 3: OPENING]\n\n"
+            "You are part of a three-agent cognitive triad. This is your opening statement. "
+            "Your peers will see it and respond in the next round.\n\n"
+            f"Question:\n{question}\n\n"
+            f"Options:\n{options_block}\n\n"
+            "INSTRUCTIONS:\n"
+            "- Evaluate each option against your accumulated knowledge\n"
+            "- Commit to ONE letter\n"
+            "- Give a two-sentence rationale — your peers will critique it\n\n"
+            "Output EXACTLY in this format:\n"
+            "LETTER: <A/B/C/D>\n"
+            "REASONING: <two sentences>"
+        )
+        raw = self._call_llm(
+            system, [{"role": "user", "content": instruction}],
+            temperature=0.3, max_tokens=300,
+            day=day, phase="FINAL_TEST", action=f"mcq_open_{question_type}",
+        )
+        letter = Evaluator.extract_labeled_letter(raw, ("LETTER",)) or "A"
+        reasoning = Evaluator.extract_reasoning(raw, "REASONING")
+        return {"letter": letter, "reasoning": reasoning, "raw": raw}
+
+    def mcq_critique(self, question: str, options: dict[str, str],
+                     own_opening: dict, peer_openings: dict[str, dict],
+                     day: int, question_type: str = "", topic: str = "") -> dict:
+        """Round 2: respond to peers with APPROVE / DISAPPROVE / REFINE / BUILD, then commit current letter.
+        Returns {'letter', 'responses': {peer_name: raw_line}, 'raw'}."""
+        from simulation.evaluator import Evaluator
+
+        system = self._exam_system_prompt(question, day)
+        options_block = self._format_options(options)
+
+        peer_lines = []
+        peer_names = list(peer_openings.keys())
+        for pname in peer_names:
+            po = peer_openings[pname]
+            peer_lines.append(f"  {pname.upper()}: LETTER {po['letter']} — {po['reasoning']}")
+        peer_block = "\n".join(peer_lines)
+
+        per_peer_output = "\n".join(
+            f"TO_{pname.upper()}: <APPROVE|DISAPPROVE|REFINE|BUILD>: <specific reason>"
+            for pname in peer_names
+        )
+
+        instruction = (
+            "HUMANITY'S LAST EXAM — MULTIPLE CHOICE [ROUND 2 of 3: CRITIQUE]\n\n"
+            f"You are {self.name.upper()} in the cognitive triad.\n\n"
+            f"Question:\n{question}\n\n"
+            f"Options:\n{options_block}\n\n"
+            "YOUR OPENING:\n"
+            f"  LETTER: {own_opening['letter']}\n"
+            f"  REASONING: {own_opening['reasoning']}\n\n"
+            f"PEER OPENINGS:\n{peer_block}\n\n"
+            "For EACH peer, choose ONE verdict and give a specific reason:\n"
+            "  APPROVE    — you agree; the reasoning holds\n"
+            "  DISAPPROVE — you think it's wrong; name the error\n"
+            "  REFINE     — partially right; fix or qualify it\n"
+            "  BUILD      — extend their reasoning using your own knowledge\n\n"
+            "Then commit your CURRENT preferred letter (you MAY change from your opening if persuaded).\n\n"
+            "Output EXACTLY in this format:\n"
+            f"{per_peer_output}\n"
+            "CURRENT_LETTER: <A/B/C/D>"
+        )
+        raw = self._call_llm(
+            system, [{"role": "user", "content": instruction}],
+            temperature=0.3, max_tokens=500,
+            day=day, phase="FINAL_TEST", action=f"mcq_critique_{question_type}",
+        )
+        letter = (
+            Evaluator.extract_labeled_letter(raw, ("CURRENT_LETTER", "LETTER"))
+            or own_opening["letter"]
+        )
+        # Best-effort per-peer response extraction for transcript logging
+        responses = {}
+        for pname in peer_names:
+            m = re.search(rf'(?im)^\s*TO_{pname.upper()}\s*:\s*(.+?)(?=\n\s*TO_|\n\s*CURRENT_LETTER|\Z)',
+                          raw, re.DOTALL)
+            responses[pname] = m.group(1).strip() if m else ""
+        return {"letter": letter, "responses": responses, "raw": raw}
+
+    def mcq_final(self, question: str, options: dict[str, str], transcript: dict,
+                  day: int, question_type: str = "", topic: str = "") -> dict:
+        """Round 3: commit FINAL letter after reading the full deliberation transcript.
+        Returns {'letter', 'reasoning', 'raw'}."""
+        from simulation.evaluator import Evaluator
+
+        system = self._exam_system_prompt(question, day)
+        options_block = self._format_options(options)
+
+        opening_lines = []
+        for name, op in transcript["openings"].items():
+            opening_lines.append(f"  {name.upper()}: LETTER {op['letter']} — {op['reasoning']}")
+        openings_block = "\n".join(opening_lines)
+
+        critique_lines = []
+        for name, cr in transcript["critiques"].items():
+            rs_parts = "; ".join(f"to {p}: {resp}" for p, resp in cr["responses"].items() if resp)
+            critique_lines.append(
+                f"  {name.upper()}: current_letter={cr['letter']}" + (f" | {rs_parts}" if rs_parts else "")
+            )
+        critiques_block = "\n".join(critique_lines)
+
+        instruction = (
+            "HUMANITY'S LAST EXAM — MULTIPLE CHOICE [ROUND 3 of 3: FINAL VOTE]\n\n"
+            f"You are {self.name.upper()} in the cognitive triad. Commit your FINAL letter after deliberation.\n\n"
+            f"Question:\n{question}\n\n"
+            f"Options:\n{options_block}\n\n"
+            f"OPENINGS:\n{openings_block}\n\n"
+            f"CRITIQUES:\n{critiques_block}\n\n"
+            "Weigh the deliberation. You may keep your position or change it based on strong arguments.\n\n"
+            "Output EXACTLY in this format:\n"
+            "FINAL_LETTER: <A/B/C/D>\n"
+            "REASONING: <one sentence justifying your final position>"
+        )
+        raw = self._call_llm(
+            system, [{"role": "user", "content": instruction}],
+            temperature=0.2, max_tokens=250,
+            day=day, phase="FINAL_TEST", action=f"mcq_final_{question_type}",
+        )
+        letter = (
+            Evaluator.extract_labeled_letter(raw, ("FINAL_LETTER", "LETTER"))
+            or transcript["critiques"].get(self.name, {}).get("letter")
+            or transcript["openings"].get(self.name, {}).get("letter")
+            or "A"
+        )
+        reasoning = Evaluator.extract_reasoning(raw, "REASONING")
+        return {"letter": letter, "reasoning": reasoning, "raw": raw}
+
+    def answer_test_question(self, question: str, question_type: str, day: int,
+                              options: dict[str, str] | None = None,
+                              use_knowledge: bool = True) -> str:
+        """Answer an MCQ test question. If use_knowledge=False, answers with raw model only (no knowledge injection)."""
         base_prompt = self.build_system_prompt(day, "FINAL_TEST", "comprehensive review")
 
         if use_knowledge:
-            # Pull from all sources: JSON stores + DB, using concept bundles for richer context
             system = self.inject_knowledge(base_prompt, question, include_deep=True, use_bundles=True)
             system = self._budget_knowledge_injection(system, max_words=config.EXAM_KNOWLEDGE_BUDGET_WORDS)
         else:
             system = base_prompt
 
+        options_block = ""
+        if options:
+            options_block = "\n".join(f"{letter}) {options[letter]}" for letter in ("A", "B", "C", "D") if letter in options)
+
         instruction = (
-            f"HUMANITY'S LAST EXAM -- SHORT ANSWER\n\n"
+            f"HUMANITY'S LAST EXAM -- MULTIPLE CHOICE\n\n"
             f"Question:\n{question}\n\n"
-            f"INSTRUCTIONS: This is Humanity's Last Exam. You MUST answer correctly.\n"
-            f"- Think step by step, reason carefully\n"
+            f"Options:\n{options_block}\n\n"
+            f"INSTRUCTIONS: This is Humanity's Last Exam. You MUST pick the correct letter.\n"
+            f"- Think step by step, evaluating each option against your knowledge\n"
             f"- Use all your accumulated knowledge across {day - 1} days of learning\n"
-            f"- Be precise and accurate -- correctness is paramount\n"
-            f"- Give a clear, definitive answer\n"
-            f"- After your reasoning, put your final answer on its own line as: ANSWER: [your answer]"
+            f"- Rule out wrong options with specific reasoning\n"
+            f"- Exactly one option is correct\n"
+            f"- On the LAST line, output ONLY: ANSWER: <letter>  (where <letter> is A, B, C, or D)"
         )
 
         messages = [{"role": "user", "content": instruction}]
         return self._call_llm(
             system, messages, temperature=0.2, max_tokens=800,
-            day=day, phase="FINAL_TEST", action=f"hle_answer_{question_type}",
+            day=day, phase="FINAL_TEST", action=f"hle_mcq_{question_type}",
         )
 
     @abstractmethod

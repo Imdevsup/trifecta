@@ -7,9 +7,16 @@ Produces:
   - dataset_manifest.json:  counts, filters, and provenance
 
 Sources (all stored untruncated in the DB):
-  - test_results:  final-exam Q&A with grader scores — highest quality SFT + DPO.
+  - test_results:  final-exam MCQs with binary scores (1 correct, 0 wrong) — SFT + DPO.
+                   Rows for agent='triad' are skipped: the triad 'answer' is the
+                   aggregated deliberation transcript, not a single-turn reply, and
+                   is not directly trainable alongside the per-agent responses.
   - interactions:  oracle answers AND full lectures (richest long-form SFT content).
   - conversations: multi-turn peer dialogue — optional, lower quality.
+
+MCQ prompts for SFT/DPO are reconstructed from the stored options_json so the
+user message the model sees during training matches what the agents saw at test
+time (question + four labeled options + instruction to finish with `ANSWER: X`).
 
 Across an 8-domain, 365-day run, the interactions table is the largest source:
 roughly one lecture per subtopic per day (~6/day) plus 15 oracle Q&A turns/day —
@@ -18,7 +25,7 @@ eight domains.
 
 Usage:
   python -m sim_logging.export_dataset
-  python -m sim_logging.export_dataset --out training_data/ --min-score 8
+  python -m sim_logging.export_dataset --out training_data/
   python -m sim_logging.export_dataset --include-conversations --include-interactions
 """
 
@@ -73,6 +80,30 @@ DEFAULT_SFT_SYSTEM_PROMPT = (
 )
 
 
+def _format_mcq_prompt(question: str, options_json: str | None) -> str | None:
+    """Reconstruct the MCQ user prompt seen at test time (question + labeled options +
+    instruction to end with ANSWER: X). Returns None if options aren't usable, so the
+    caller can skip the row rather than train on a malformed prompt."""
+    if not options_json:
+        return None
+    try:
+        options = json.loads(options_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(options, dict):
+        return None
+    ordered = [(l, options[l]) for l in ("A", "B", "C", "D") if l in options]
+    if len(ordered) != 4:
+        return None
+    options_block = "\n".join(f"{l}) {text}" for l, text in ordered)
+    return (
+        "Multiple choice question. Reason step by step, then finish with a single "
+        "line 'ANSWER: <letter>' where <letter> is A, B, C, or D.\n\n"
+        f"Question:\n{question.strip()}\n\n"
+        f"Options:\n{options_block}"
+    )
+
+
 @dataclass
 class ExportStats:
     sft_from_tests: int = 0
@@ -93,29 +124,37 @@ def _iter_test_sft(
     system_prompt: str,
     stats: ExportStats,
 ) -> Iterator[dict]:
-    """Yield SFT records from test_results where score >= min_score and content is clean."""
+    """Yield SFT records from test_results where score >= min_score and content is clean.
+    Reconstructs the full MCQ prompt (question + options) so the trained model sees
+    the same input the agents saw at test time. Triad rows are skipped because the
+    transcript format is not directly trainable as single-turn chat."""
     rows = conn.execute(
         """
-        SELECT agent, question_number, question_type, question, answer, score
+        SELECT agent, question_number, question_type, question, options_json, answer, score
         FROM test_results
         WHERE score >= ?
+          AND agent != 'triad'
         ORDER BY question_number, agent
         """,
         (min_score,),
     ).fetchall()
 
-    for _agent, _qnum, _qtype, question, answer, _score in rows:
+    for _agent, _qnum, _qtype, question, options_json, answer, _score in rows:
         if not _is_clean(question):
             stats.dropped_short += 1
             continue
         if not _is_clean(answer):
             stats.dropped_error += 1
             continue
+        user_prompt = _format_mcq_prompt(question, options_json)
+        if user_prompt is None:
+            stats.dropped_short += 1
+            continue
 
         yield {
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question.strip()},
+                {"role": "user", "content": user_prompt},
                 {"role": "assistant", "content": answer.strip()},
             ]
         }
@@ -130,22 +169,28 @@ def _iter_test_dpo(
     stats: ExportStats,
 ) -> Iterator[dict]:
     """Yield DPO pairs by grouping test_results per question (best vs worst agent answer).
-    Only pairs where the score gap is >= min_gap and the answers differ."""
+    Reconstructs the MCQ prompt (question + options) for each pair. Only pairs where
+    the score gap is >= min_gap and the answers differ. Triad rows are skipped so the
+    pair is always per-agent vs per-agent at the same question."""
     rows = conn.execute(
         """
-        SELECT question_number, question, agent, answer, score
+        SELECT question_number, question, options_json, agent, answer, score
         FROM test_results
+        WHERE agent != 'triad'
         ORDER BY question_number, score DESC
         """
     ).fetchall()
 
     groups: dict[int, list[tuple]] = {}
-    questions: dict[int, str] = {}
-    for qnum, question, agent, answer, score in rows:
+    prompts: dict[int, str] = {}
+    for qnum, question, options_json, agent, answer, score in rows:
         if not _is_clean(question) or not _is_clean(answer):
             continue
+        user_prompt = _format_mcq_prompt(question, options_json)
+        if user_prompt is None:
+            continue
         groups.setdefault(qnum, []).append((agent, answer.strip(), score))
-        questions.setdefault(qnum, question.strip())
+        prompts.setdefault(qnum, user_prompt)
 
     for qnum, candidates in groups.items():
         if len(candidates) < 2:
@@ -160,7 +205,7 @@ def _iter_test_dpo(
             continue
 
         yield {
-            "prompt": questions[qnum],
+            "prompt": prompts[qnum],
             "chosen": best_answer,
             "rejected": worst_answer,
             "chosen_score": best_score,
@@ -305,8 +350,8 @@ def _write_manifest(path: Path, stats: ExportStats, params: dict, db_path: Path)
 def export_dataset(
     db_path: Path,
     out_dir: Path,
-    min_score: float = 7.0,
-    dpo_gap: float = 3.0,
+    min_score: float = 1.0,
+    dpo_gap: float = 1.0,
     include_conversations: bool = False,
     include_interactions: bool = False,
     system_prompt: str = DEFAULT_SFT_SYSTEM_PROMPT,
@@ -363,10 +408,10 @@ def main() -> int:
                         help=f"Path to simulation DB (default: {config.LOG_DB_PATH})")
     parser.add_argument("--out", type=Path, default=Path("training_data"),
                         help="Output directory for JSONL files (default: training_data/)")
-    parser.add_argument("--min-score", type=float, default=7.0,
-                        help="Minimum grader score (0-10) for SFT inclusion from test_results (default: 7.0)")
-    parser.add_argument("--dpo-gap", type=float, default=3.0,
-                        help="Minimum score gap between chosen and rejected for DPO pairs (default: 3.0)")
+    parser.add_argument("--min-score", type=float, default=1.0,
+                        help="Minimum MCQ score (0 or 1) for SFT inclusion from test_results — 1.0 keeps only correct answers (default: 1.0)")
+    parser.add_argument("--dpo-gap", type=float, default=1.0,
+                        help="Minimum score gap between chosen (correct) and rejected (wrong) for DPO pairs (default: 1.0)")
     parser.add_argument("--include-conversations", action="store_true",
                         help="Also export peer conversations as multi-turn SFT (lower quality)")
     parser.add_argument("--include-interactions", action="store_true",
@@ -417,7 +462,7 @@ def main() -> int:
     if stats.sft_total == 0 and stats.dpo_pairs == 0:
         print(
             "\nWarning: no records exported. Is the simulation DB populated, "
-            "and has the final test been run? Try a lower --min-score.",
+            "and has the final test been run? Try --include-interactions or --include-conversations.",
             file=sys.stderr,
         )
         return 1
